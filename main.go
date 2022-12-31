@@ -3,14 +3,28 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"net/http"
+	"time"
+
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	_ "github.com/influxdata/influxdb1-client" // this is important because of the bug in go mod
 	influx "github.com/influxdata/influxdb1-client/v2"
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
-	"os"
-	"os/signal"
-	"syscall"
-	"time"
+)
+
+var (
+	heatingEventsReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "tasmota.sensor.heating.values.received",
+		Help: "The total number of received events",
+	})
+	powerEventsReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "tasmota.sensor.power.values.received",
+		Help: "The total number of received events",
+	})
 )
 
 func main() {
@@ -18,9 +32,6 @@ func main() {
 	influxAddress := flag.String("influx-address", "http://192.168.2.3:8086", "influx broker")
 	logrus.Infof("using mqtt %s", *mqttAddress)
 	logrus.Infof("using influx %s", *influxAddress)
-
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 
 	influxClient, _ := influx.NewHTTPClient(influx.HTTPConfig{
 		Addr:     *influxAddress,
@@ -32,15 +43,16 @@ func main() {
 
 	mqttClient := mqtt.NewClient(clientOptions)
 	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
-		logrus.Panic(token.Error())
+		logrus.Fatal(token.Error())
 	}
 
-	if token := mqttClient.Subscribe("tele/#", 0, onMessage(influxClient)); token.Wait() && token.Error() != nil {
-		logrus.Panic(token.Error())
+	if token := mqttClient.Subscribe("tele/#", 2, onMessage(influxClient)); token.Wait() && token.Error() != nil {
+		logrus.Fatal(token.Error())
 	}
 
 	defer mqttClient.Disconnect(1000)
-	<-c
+	http.Handle("/metrics", promhttp.Handler())
+	_ = http.ListenAndServe(":2112", nil)
 }
 
 func onMessage(influxClient influx.Client) func(client mqtt.Client, message mqtt.Message) {
@@ -48,23 +60,34 @@ func onMessage(influxClient influx.Client) func(client mqtt.Client, message mqtt
 		switch message.Topic() {
 		case "tele/tasmota_FA2642/SENSOR":
 			logrus.Infof("Topic: %s Payload: %s", message.Topic(), message.Payload())
-			sendSensorPayload("Power", message, influxClient)
+			err := sendSensorPayload("Power", message, influxClient)
+			switch err {
+			case nil:
+				powerEventsReceived.Inc()
+			default:
+				logrus.Errorf("error writing point: %s", err)
+			}
+
 		case "tele/tasmota_5BEF46/SENSOR":
 			logrus.Infof("Topic: %s Payload: %s", message.Topic(), message.Payload())
-			sendSensorPayload("Heating", message, influxClient)
+			err := sendSensorPayload("Heating", message, influxClient)
+			switch err {
+			case nil:
+				heatingEventsReceived.Inc()
+			default:
+				logrus.Errorf("error writing point: %s", err)
+			}
 		}
 	}
 }
 
-func sendSensorPayload(counter string, message mqtt.Message, writeApi influx.Client) {
+func sendSensorPayload(counter string, message mqtt.Message, writeApi influx.Client) error {
 	var sensor SensorPayload
 	err := json.Unmarshal(message.Payload(), &sensor)
 	if err != nil {
-		logrus.Errorf("parse sensor payload: %s", err)
-		return
+		return errors.WithMessagef(err, "parse sensor payload: %s", err)
 	}
 	fields := map[string]any{
-
 		"counter": counter,
 		"totalIn": sensor.MT681.TotalIn,
 		"current": sensor.MT681.PowerCur,
@@ -73,10 +96,7 @@ func sendSensorPayload(counter string, message mqtt.Message, writeApi influx.Cli
 	p, _ := influx.NewPoint("MT681", map[string]string{"counter": counter}, fields, time.Now())
 	batch, _ := influx.NewBatchPoints(influx.BatchPointsConfig{Database: "db0"})
 	batch.AddPoint(p)
-	err = writeApi.Write(batch)
-	if err != nil {
-		logrus.Errorf("error writing point: %s", err)
-	}
+	return writeApi.Write(batch)
 }
 
 type SensorPayload struct {
@@ -90,27 +110,4 @@ type SensorPayload struct {
 		TotalOut float64 `json:"Total_out"`
 		MeterId  string  `json:"Meter_id"`
 	} `json:"MT681"`
-}
-
-type StatePayload struct {
-	Time      string `json:"Time"`
-	Uptime    string `json:"Uptime"`
-	UptimeSec int    `json:"UptimeSec"`
-	Heap      int    `json:"Heap"`
-	SleepMode string `json:"SleepMode"`
-	Sleep     int    `json:"Sleep"`
-	LoadAvg   int    `json:"LoadAvg"`
-	MqttCount int    `json:"MqttCount"`
-	POWER     string `json:"POWER"`
-	Wifi      struct {
-		AP        int    `json:"AP"`
-		SSId      string `json:"SSId"`
-		BSSId     string `json:"BSSId"`
-		Channel   int    `json:"Channel"`
-		Mode      string `json:"Mode"`
-		RSSI      int    `json:"RSSI"`
-		Signal    int    `json:"Signal"`
-		LinkCount int    `json:"LinkCount"`
-		Downtime  string `json:"Downtime"`
-	} `json:"Wifi"`
 }
