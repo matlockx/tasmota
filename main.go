@@ -3,6 +3,8 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	"github.com/go-resty/resty/v2"
+	"github.com/robfig/cron/v3"
 	"net/http"
 	"time"
 
@@ -18,11 +20,11 @@ import (
 
 var (
 	heatingEventsReceived = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "tasmota.sensor.heating.values.received",
+		Name: "tasmota_sensor_heating_values_received",
 		Help: "The total number of received events",
 	})
 	powerEventsReceived = promauto.NewCounter(prometheus.CounterOpts{
-		Name: "tasmota.sensor.power.values.received",
+		Name: "tasmota_sensor_power_values_received",
 		Help: "The total number of received events",
 	})
 )
@@ -39,6 +41,19 @@ func main() {
 		Password: "admin",
 	})
 
+	// Seconds field, required
+	c := cron.New()
+	c.Start()
+	defer c.Stop()
+
+	httpClient := resty.New()
+	httpClient.SetTimeout(5 * time.Second)
+	getTemparatureFunc(httpClient, influxClient)()
+	_, err := c.AddFunc("@every 1m", getTemparatureFunc(httpClient, influxClient))
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
 	clientOptions := mqtt.NewClientOptions().AddBroker(*mqttAddress).SetClientID("tasmota")
 
 	mqttClient := mqtt.NewClient(clientOptions)
@@ -53,6 +68,44 @@ func main() {
 	defer mqttClient.Disconnect(1000)
 	http.Handle("/metrics", promhttp.Handler())
 	_ = http.ListenAndServe(":2112", nil)
+}
+
+func getTemparatureFunc(client *resty.Client, influxClient influx.Client) func() {
+
+	return func() {
+		resp, err := client.R().
+			SetResult(&WeatherResponse{}).
+			Get("https://api.open-meteo.com/v1/forecast?latitude=53.62683137619131&longitude=10.147529746754728&current_weather=true&timezone=Europe%2FBerlin")
+
+		if err != nil {
+			logrus.Errorf("error getting weather: %s", err)
+			return
+		}
+
+		if resp.IsError() {
+			logrus.Errorf("error getting weather: %s", resp.Status())
+			return
+		}
+
+		weather := resp.Result().(*WeatherResponse)
+		logrus.Debugf("weather: %s", weather)
+
+		fields := map[string]any{
+			"temperature":   weather.CurrentWeather.Temperature,
+			"windspeed":     weather.CurrentWeather.Windspeed,
+			"winddirection": weather.CurrentWeather.Winddirection,
+			"weathercode":   weather.CurrentWeather.Weathercode,
+			"time":          weather.CurrentWeather.Time,
+		}
+		logrus.Infof("current temperature is: %f°C", weather.CurrentWeather.Temperature)
+		p, _ := influx.NewPoint("Temperature", map[string]string{"service": "https://open-meteo.com"}, fields, time.Now())
+		batch, _ := influx.NewBatchPoints(influx.BatchPointsConfig{Database: "db0"})
+		batch.AddPoint(p)
+		err = influxClient.Write(batch)
+		if err != nil {
+			logrus.Errorf("error writing point: %s", err)
+		}
+	}
 }
 
 func onMessage(influxClient influx.Client) func(client mqtt.Client, message mqtt.Message) {
@@ -110,4 +163,21 @@ type SensorPayload struct {
 		TotalOut float64 `json:"Total_out"`
 		MeterId  string  `json:"Meter_id"`
 	} `json:"MT681"`
+}
+
+type WeatherResponse struct {
+	Latitude             float64 `json:"latitude"`
+	Longitude            float64 `json:"longitude"`
+	GenerationtimeMs     float64 `json:"generationtime_ms"`
+	UtcOffsetSeconds     int     `json:"utc_offset_seconds"`
+	Timezone             string  `json:"timezone"`
+	TimezoneAbbreviation string  `json:"timezone_abbreviation"`
+	Elevation            float64 `json:"elevation"`
+	CurrentWeather       struct {
+		Temperature   float64 `json:"temperature"`
+		Windspeed     float64 `json:"windspeed"`
+		Winddirection float64 `json:"winddirection"`
+		Weathercode   int     `json:"weathercode"`
+		Time          string  `json:"time"`
+	} `json:"current_weather"`
 }
