@@ -27,11 +27,20 @@ var (
 		Name: "tasmota_sensor_power_values_received",
 		Help: "The total number of received events",
 	})
+	heatingSonoffEventsReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "sonoff_sensor_heating_values_received",
+		Help: "The total number of received events",
+	})
+	livingRoomSonoffEventsReceived = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "sonoff_sensor_living_room_values_received",
+		Help: "The total number of received events",
+	})
 )
 
 func main() {
 	mqttAddress := flag.String("mqtt-address", "192.168.2.3:1883", "mqtt broker")
 	influxAddress := flag.String("influx-address", "http://192.168.2.3:8086", "influx broker")
+	debug := flag.Bool("debug", false, "debug")
 	logrus.Infof("using mqtt %s", *mqttAddress)
 	logrus.Infof("using influx %s", *influxAddress)
 
@@ -53,14 +62,24 @@ func main() {
 	if err != nil {
 		logrus.Fatal(err)
 	}
+	clientId := "lutterome"
+	if debug != nil && *debug {
+		clientId = "lutterome-debug"
+	}
 
-	clientOptions := mqtt.NewClientOptions().AddBroker(*mqttAddress).SetClientID("tasmota")
+	clientOptions := mqtt.NewClientOptions().AddBroker(*mqttAddress).SetClientID(clientId)
 
 	mqttClient := mqtt.NewClient(clientOptions)
 	if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
 		logrus.Fatal(token.Error())
 	}
 
+	logrus.Infof("subscribe to zigbee2mqtt/#")
+	if token := mqttClient.Subscribe("zigbee2mqtt/#", 2, onMessage(influxClient)); token.Wait() && token.Error() != nil {
+		logrus.Fatal(token.Error())
+	}
+
+	logrus.Infof("subscribe to tele/#")
 	if token := mqttClient.Subscribe("tele/#", 2, onMessage(influxClient)); token.Wait() && token.Error() != nil {
 		logrus.Fatal(token.Error())
 	}
@@ -130,8 +149,46 @@ func onMessage(influxClient influx.Client) func(client mqtt.Client, message mqtt
 			default:
 				logrus.Errorf("error writing point: %s", err)
 			}
+		case "zigbee2mqtt/0x00124b0029103793":
+			logrus.Infof("Topic: %s Payload: %s", message.Topic(), message.Payload())
+			counter := "Heating"
+			if err := sendTemperatureSensorPayload(counter, message, influxClient); err != nil {
+				logrus.Errorf("error writing temperature for %s : %s", counter, err)
+			} else {
+				heatingSonoffEventsReceived.Inc()
+			}
+		case "zigbee2mqtt/0x00124b00291037a4":
+			logrus.Infof("Topic: %s Payload: %s", message.Topic(), message.Payload())
+			counter := "LivingRoom"
+			if err := sendTemperatureSensorPayload(counter, message, influxClient); err != nil {
+				logrus.Errorf("error writing temperature for %s : %s", counter, err)
+			} else {
+				livingRoomSonoffEventsReceived.Inc()
+			}
+		default:
+			//logrus.Infof("Topic: %s Payload:", message.Topic())
+			//logrus.Infof("Topic: %s Payload: %s", message.Topic(), message.Payload())
 		}
 	}
+}
+
+func sendTemperatureSensorPayload(counter string, message mqtt.Message, writeApi influx.Client) error {
+	var sensor SonoffTemperature
+	err := json.Unmarshal(message.Payload(), &sensor)
+	if err != nil {
+		return errors.WithMessagef(err, "parse sensor payload: %s", err)
+	}
+	fields := map[string]any{
+		"counter":     counter,
+		"temperature": sensor.Temperature,
+		"humidity":    sensor.Humidity,
+		"battery":     sensor.Battery,
+		"voltage":     sensor.Voltage,
+	}
+	p, _ := influx.NewPoint("TemperatureSensor", map[string]string{"counter": counter}, fields, time.Now())
+	batch, _ := influx.NewBatchPoints(influx.BatchPointsConfig{Database: "db0"})
+	batch.AddPoint(p)
+	return writeApi.Write(batch)
 }
 
 func sendSensorPayload(counter string, message mqtt.Message, writeApi influx.Client) error {
@@ -180,4 +237,12 @@ type WeatherResponse struct {
 		Weathercode   int     `json:"weathercode"`
 		Time          string  `json:"time"`
 	} `json:"current_weather"`
+}
+
+type SonoffTemperature struct {
+	Battery     int     `json:"battery"`
+	Humidity    float64 `json:"humidity"`
+	Linkquality int     `json:"linkquality"`
+	Temperature float64 `json:"temperature"`
+	Voltage     int     `json:"voltage"`
 }
