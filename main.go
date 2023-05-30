@@ -182,7 +182,7 @@ func sendTemperatureSensorPayload(counter string, message mqtt.Message, writeApi
 		"counter":     counter,
 		"temperature": sensor.Temperature,
 		"humidity":    sensor.Humidity,
-		"battery":     sensor.Battery,
+		"batteryf":    sensor.Battery,
 		"voltage":     sensor.Voltage,
 	}
 	p, _ := influx.NewPoint("TemperatureSensor", map[string]string{"counter": counter}, fields, time.Now())
@@ -240,7 +240,7 @@ type WeatherResponse struct {
 }
 
 type SonoffTemperature struct {
-	Battery     int     `json:"battery"`
+	Battery     float64 `json:"battery"`
 	Humidity    float64 `json:"humidity"`
 	Linkquality int     `json:"linkquality"`
 	Temperature float64 `json:"temperature"`
