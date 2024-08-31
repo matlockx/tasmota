@@ -3,18 +3,19 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"github.com/go-resty/resty/v2"
-	"github.com/robfig/cron/v3"
 	"net/http"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
+	"github.com/go-resty/resty/v2"
+	"github.com/influxdata/influxdb-client-go/v2"
+	"github.com/influxdata/influxdb-client-go/v2/api"
 	_ "github.com/influxdata/influxdb1-client" // this is important because of the bug in go mod
-	influx "github.com/influxdata/influxdb1-client/v2"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/robfig/cron/v3"
 	"github.com/sirupsen/logrus"
 )
 
@@ -38,17 +39,16 @@ var (
 )
 
 func main() {
-	mqttAddress := flag.String("mqtt-address", "192.168.2.3:1883", "mqtt broker")
-	influxAddress := flag.String("influx-address", "http://192.168.2.3:8086", "influx broker")
+	mqttAddress := flag.String("mqtt-address", "192.168.2.73:1883", "mqtt broker")
+	influxAddress := flag.String("influx-address", "http://192.168.2.73:8086", "influx broker")
 	debug := flag.Bool("debug", false, "debug")
 	logrus.Infof("using mqtt %s", *mqttAddress)
 	logrus.Infof("using influx %s", *influxAddress)
 
-	influxClient, _ := influx.NewHTTPClient(influx.HTTPConfig{
-		Addr:     *influxAddress,
-		Username: "admin",
-		Password: "admin",
-	})
+	influxClient := influxdb2.NewClient(*influxAddress, "4eYvsu8wZCJ6tKuE2sxvFHkvYFwSMVK0011hEEiojvejzpSaij86vYQomN_12au6eK-2MZ6Knr-Sax201y70w==")
+	influxWriteApi := influxClient.WriteAPI("lutterome", "dompfaffenweg")
+
+	defer influxClient.Close()
 
 	// Seconds field, required
 	c := cron.New()
@@ -57,8 +57,8 @@ func main() {
 
 	httpClient := resty.New()
 	httpClient.SetTimeout(5 * time.Second)
-	getTemparatureFunc(httpClient, influxClient)()
-	_, err := c.AddFunc("@every 1m", getTemparatureFunc(httpClient, influxClient))
+	getTemparatureFunc(httpClient, influxWriteApi)()
+	_, err := c.AddFunc("@every 1m", getTemparatureFunc(httpClient, influxWriteApi))
 	if err != nil {
 		logrus.Fatal(err)
 	}
@@ -75,12 +75,12 @@ func main() {
 	}
 
 	logrus.Infof("subscribe to zigbee2mqtt/#")
-	if token := mqttClient.Subscribe("zigbee2mqtt/#", 2, onMessage(influxClient)); token.Wait() && token.Error() != nil {
+	if token := mqttClient.Subscribe("zigbee2mqtt/#", 2, onMessage(influxWriteApi)); token.Wait() && token.Error() != nil {
 		logrus.Fatal(token.Error())
 	}
 
 	logrus.Infof("subscribe to tele/#")
-	if token := mqttClient.Subscribe("tele/#", 2, onMessage(influxClient)); token.Wait() && token.Error() != nil {
+	if token := mqttClient.Subscribe("tele/#", 2, onMessage(influxWriteApi)); token.Wait() && token.Error() != nil {
 		logrus.Fatal(token.Error())
 	}
 
@@ -89,7 +89,7 @@ func main() {
 	_ = http.ListenAndServe(":2112", nil)
 }
 
-func getTemparatureFunc(client *resty.Client, influxClient influx.Client) func() {
+func getTemparatureFunc(client *resty.Client, influxClient api.WriteAPI) func() {
 
 	return func() {
 		resp, err := client.R().
@@ -117,17 +117,12 @@ func getTemparatureFunc(client *resty.Client, influxClient influx.Client) func()
 			"time":          weather.CurrentWeather.Time,
 		}
 		logrus.Infof("current temperature is: %f°C", weather.CurrentWeather.Temperature)
-		p, _ := influx.NewPoint("Temperature", map[string]string{"service": "https://open-meteo.com"}, fields, time.Now())
-		batch, _ := influx.NewBatchPoints(influx.BatchPointsConfig{Database: "db0"})
-		batch.AddPoint(p)
-		err = influxClient.Write(batch)
-		if err != nil {
-			logrus.Errorf("error writing point: %s", err)
-		}
+		p := influxdb2.NewPoint("Temperature", map[string]string{"service": "https://open-meteo.com"}, fields, time.Now())
+		influxClient.WritePoint(p)
 	}
 }
 
-func onMessage(influxClient influx.Client) func(client mqtt.Client, message mqtt.Message) {
+func onMessage(influxClient api.WriteAPI) func(client mqtt.Client, message mqtt.Message) {
 	return func(client mqtt.Client, message mqtt.Message) {
 		switch message.Topic() {
 		case "tele/tasmota_FA2642/SENSOR":
@@ -172,7 +167,7 @@ func onMessage(influxClient influx.Client) func(client mqtt.Client, message mqtt
 	}
 }
 
-func sendTemperatureSensorPayload(counter string, message mqtt.Message, writeApi influx.Client) error {
+func sendTemperatureSensorPayload(counter string, message mqtt.Message, writeApi api.WriteAPI) error {
 	var sensor SonoffTemperature
 	err := json.Unmarshal(message.Payload(), &sensor)
 	if err != nil {
@@ -185,13 +180,12 @@ func sendTemperatureSensorPayload(counter string, message mqtt.Message, writeApi
 		"batteryf":    sensor.Battery,
 		"voltage":     sensor.Voltage,
 	}
-	p, _ := influx.NewPoint("TemperatureSensor", map[string]string{"counter": counter}, fields, time.Now())
-	batch, _ := influx.NewBatchPoints(influx.BatchPointsConfig{Database: "db0"})
-	batch.AddPoint(p)
-	return writeApi.Write(batch)
+	p := influxdb2.NewPoint("TemperatureSensor", map[string]string{"counter": counter}, fields, time.Now())
+	writeApi.WritePoint(p)
+	return nil
 }
 
-func sendSensorPayload(counter string, message mqtt.Message, writeApi influx.Client) error {
+func sendSensorPayload(counter string, message mqtt.Message, writeApi api.WriteAPI) error {
 	var sensor SensorPayload
 	err := json.Unmarshal(message.Payload(), &sensor)
 	if err != nil {
@@ -203,10 +197,9 @@ func sendSensorPayload(counter string, message mqtt.Message, writeApi influx.Cli
 		"current": sensor.MT681.PowerCur,
 		"meterId": sensor.MT681.MeterId,
 	}
-	p, _ := influx.NewPoint("MT681", map[string]string{"counter": counter}, fields, time.Now())
-	batch, _ := influx.NewBatchPoints(influx.BatchPointsConfig{Database: "db0"})
-	batch.AddPoint(p)
-	return writeApi.Write(batch)
+	p := influxdb2.NewPoint("MT681", map[string]string{"counter": counter}, fields, time.Now())
+	writeApi.WritePoint(p)
+	return nil
 }
 
 type SensorPayload struct {
