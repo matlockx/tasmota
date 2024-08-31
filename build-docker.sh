@@ -1,5 +1,5 @@
 #!/bin/bash
 
-docker build --platform linux/arm/v7 -t matlockx/tasmota .
+docker build --platform linux/arm/v8 -t matlockx/tasmota .
 docker push matlockx/tasmota
 

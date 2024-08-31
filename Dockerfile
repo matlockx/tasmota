@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.19.4-bullseye as builder
+FROM --platform=$BUILDPLATFORM golang:1.23.0-bookworm as builder
 WORKDIR /usr/src/app
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
@@ -10,6 +10,6 @@ RUN --mount=target=. \
     --mount=type=cache,target=/go/pkg \
     GOOS=$TARGETOS GOARCH=$TARGETARCH go build -v -o /out/binary ./...
 
-FROM alpine:latest
+FROM arm64v8/alpine:latest
 COPY --from=builder /out/binary /tasmota
 CMD  ["/tasmota"]

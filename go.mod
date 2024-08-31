@@ -1,6 +1,6 @@
 module github.com/matlockx/tasmota
 
-go 1.20
+go 1.23
 
 require (
 	github.com/eclipse/paho.mqtt.golang v1.4.2
